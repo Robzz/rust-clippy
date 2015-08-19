@@ -239,6 +239,27 @@ pub fn is_negative(ty: LitIntType) -> bool {
     }
 }
 
+fn get_sign(cty: LitIntType) -> Sign {
+    match cty {
+        SignedIntLit(_, sign) | UnsuffixedIntLit(sign) => sign,
+        _ => Plus,
+    }
+}
+
+//TODO: Should negative have any bearing on the result?
+fn clamp(value: u64, _negative: bool, bits: u8) -> Option<u64> {
+    if bits == 64 || value <= (1 << bits) - 1 { Some(value) } else { None }
+}
+
+fn with_ty<T, F: FnOnce(&str) -> Option<T>>(ty: &Ty, f: F) -> Option<T> {
+    if let TyPath(_, ref path) = ty.node {
+        if path.segments.len() == 1 {
+            f(&path.segments[0].identifier.name.as_str().to_owned());
+        }
+    }
+    None
+}
+
 fn unify_int_type(l: LitIntType, r: LitIntType, s: Sign) -> Option<LitIntType> {
     match (l, r) {
         (SignedIntLit(lty, _), SignedIntLit(rty, _)) => if lty == rty {
@@ -311,11 +332,30 @@ impl<'c, 'cc> ConstEvalContext<'c, 'cc> {
                     UnNeg => constant_negate(o),
                     UnUniq | UnDeref => Some(o),
                 }),
-            ExprBinary(op, ref left, ref right) =>
-                self.binop(op, left, right),
+            ExprBinary(op, ref left, ref right) => self.binop(op, left, right),
+            ExprCast(ref value, ref ty) => self.cast(value, ty),
+            ExprIndex(ref x, ref index) =>
+                if let ExprVec(ref v) = x.node {
+                    self.expr(index).and_then(
+                        |i| self.index(v, i.as_u64() as usize) )
+                } else { None },
+            ExprTupField(ref x, ref i) =>
+                if let ExprTup(ref t) = x.node {
+                    self.index(t, i.node)
+                } else { None },
             //TODO: add other expressions
+            //ExprStruct(Path, Vec<Field>, Option<P<Expr>>),
+            //ExprField(P<Expr>, SpannedIdent),
+            //ExprRange(Option<P<Expr>>, Option<P<Expr>>),
+            //ExprBox(Option<P<Expr>>, P<Expr>),
+            //ExprAddrOf(Mutability, P<Expr>),
+            //ExprCall? for enum variants
             _ => None,
         }
+    }
+
+    fn index(&mut self, vec: &[P<Expr>], idx: usize) -> Option<Constant> {
+        if idx < vec.len() { self.expr(&*vec[idx]) } else { None }
     }
 
     /// create `Some(Vec![..])` of all constants, unless there is any
@@ -476,5 +516,58 @@ impl<'c, 'cc> ConstEvalContext<'c, 'cc> {
                 }
             } else { None }
         )
+    }
+
+    fn cast(&mut self, value: &Expr, ty: &Ty) -> Option<Constant> {
+        self.expr(value).and_then(|v| with_ty(ty, |ty_i|
+            match (v, ty_i) {
+            (ConstantBool(b), "u8") =>
+                Some(ConstantInt(b as u64, UnsignedIntLit(TyU8))),
+            (ConstantBool(b), "u16") =>
+                Some(ConstantInt(b as u64, UnsignedIntLit(TyU16))),
+            (ConstantBool(b), "u32") =>
+                Some(ConstantInt(b as u64, UnsignedIntLit(TyU32))),
+            (ConstantBool(b), "u64") =>
+                Some(ConstantInt(b as u64, UnsignedIntLit(TyU64))),
+            (ConstantBool(b), "usize") => // no need to guess here
+                Some(ConstantInt(b as u64, UnsignedIntLit(TyUs))),
+
+            (ConstantBool(b), "i8") =>
+                Some(ConstantInt(b as u64, SignedIntLit(TyI8, Plus))),
+            (ConstantBool(b), "i16") =>
+                Some(ConstantInt(b as u64, SignedIntLit(TyI16, Plus))),
+            (ConstantBool(b), "i32") =>
+                Some(ConstantInt(b as u64, SignedIntLit(TyI32, Plus))),
+            (ConstantBool(b), "i64") =>
+                Some(ConstantInt(b as u64, SignedIntLit(TyI64, Plus))),
+            (ConstantBool(b), "isize") => // no need to guess here
+                Some(ConstantInt(b as u64, SignedIntLit(TyIs, Plus))),
+
+            (ConstantInt(v, _), "u8") =>
+                Some(ConstantInt(v & ::std::u8::MAX as u64, UnsignedIntLit(TyU8))),
+            (ConstantInt(v, _), "u16") =>
+                Some(ConstantInt(v & ::std::u16::MAX as u64, UnsignedIntLit(TyU16))),
+            (ConstantInt(v, _), "u32") =>
+                Some(ConstantInt(v & ::std::u32::MAX as u64, UnsignedIntLit(TyU32))),
+            (ConstantInt(v, _), "u64") =>
+                Some(ConstantInt(v & ::std::u64::MAX as u64, UnsignedIntLit(TyU64))),
+            (ConstantInt(v, cty), "usize") =>
+                // if it fits in 32 bits, OK, else refuse to guess
+                if is_negative(cty) || v > ::std::u32::MAX as u64 {
+                    None
+                } else { Some(ConstantInt(v, UnsignedIntLit(TyUs))) },
+
+            (ConstantInt(v, cty), "i8") => clamp(v, is_negative(cty), 8)
+                .map(|v| ConstantInt(v, SignedIntLit(TyI8, get_sign(cty)))),
+            (ConstantInt(v, cty), "i16") => clamp(v, is_negative(cty), 16)
+                .map(|v| ConstantInt(v, SignedIntLit(TyI16, get_sign(cty)))),
+            (ConstantInt(v, cty), "i32") => clamp(v, is_negative(cty), 32)
+                .map(|v| ConstantInt(v, SignedIntLit(TyI32, get_sign(cty)))),
+            (ConstantInt(v, cty), "i64") => clamp(v, is_negative(cty), 64)
+                .map(|v| ConstantInt(v, SignedIntLit(TyI64, get_sign(cty)))),
+            (ConstantInt(v, cty), "isize") => clamp(v, is_negative(cty),
+                32).map(|v| ConstantInt(v, SignedIntLit(TyIs, get_sign(cty)))),
+            _ => None, //TODO: is it better to ignore casts?
+        }))
     }
 }
